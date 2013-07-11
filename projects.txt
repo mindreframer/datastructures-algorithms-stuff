@@ -1,1 +1,3 @@
 https://github.com/mindreframer/source-data-structures-and-algorithms-with-oop.git
+https://github.com/jeremycole/innodb_ruby.git
+https://github.com/jeremycole/innodb_diagrams.git
