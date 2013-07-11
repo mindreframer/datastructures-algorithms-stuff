@@ -1,0 +1,820 @@
+#!/usr/bin/env ruby
+
+require "getoptlong"
+require "ostruct"
+require "pp"
+require "innodb"
+
+def print_lists(lists)
+  puts "%-20s%-12s%-12s%-12s%-12s%-12s" % [
+    "name",
+    "length",
+    "f_page",
+    "f_offset",
+    "l_page",
+    "l_offset",
+  ]
+
+  lists.each do |name, list|
+    puts "%-20s%-12i%-12i%-12i%-12i%-12i" % [
+      name,
+      list.base[:length],
+      list.base[:first] && list.base[:first][:page]   || 0,
+      list.base[:first] && list.base[:first][:offset] || 0,
+      list.base[:last]  && list.base[:last][:page]    || 0,
+      list.base[:last]  && list.base[:last][:offset]  || 0,
+    ]
+  end
+end
+
+def print_xdes_list(list)
+  puts "%-12s%-64s" % [
+    "start_page",
+    "page_used_bitmap"
+  ]
+
+  list.each do |entry|
+    puts "%-12i%-64s" % [
+      entry.xdes[:start_page],
+      entry.each_page_status.inject("") { |bitmap, page_status|
+        bitmap += page_status[:free] ? "." : "#"
+        bitmap
+      },
+    ]
+  end
+end
+
+def print_index_page_summary(pages)
+  puts "%-12s%-8s%-8s%-8s%-8s%-8s" % [
+    "page",
+    "index",
+    "level",
+    "data",
+    "free",
+    "records",
+  ]
+
+  pages.each do |page_number, page|
+    case page.type
+    when :INDEX
+      puts "%-12i%-8i%-8i%-8i%-8i%-8i" % [
+        page_number,
+        page.page_header[:index_id],
+        page.level,
+        page.record_space,
+        page.free_space,
+        page.records,
+      ]
+    when :ALLOCATED
+      puts "%-12i%-8i%-8i%-8i%-8i%-8i" % [ page_number, 0, 0, 0, page.size, 0 ]
+    end
+  end
+end
+
+def space_summary(space, start_page)
+  puts "%-12s%-20s%-12s%-12s%-20s" % [
+    "page",
+    "type",
+    "prev",
+    "next",
+    "lsn",
+  ]
+
+  space.each_page(start_page) do |page_number, page|
+    puts "%-12i%-20s%-12i%-12i%-20i" % [
+      page_number,
+      page.type,
+      page.prev || 0,
+      page.next || 0,
+      page.lsn  || 0,
+    ]
+  end
+end
+
+def space_index_pages_summary(space, start_page)
+  print_index_page_summary(space.each_page(start_page))
+end
+
+def space_page_type_regions(space, start_page)
+  puts "%-12s%-12s%-12s%-20s" % [
+    "start",
+    "end",
+    "count",
+    "type",
+  ]
+
+  space.each_page_type_region(start_page) do |region|
+    puts "%-12i%-12i%-12i%-20s" % [
+      region[:start],
+      region[:end],
+      region[:count],
+      region[:type],
+    ]
+  end
+end
+
+def space_lists(space)
+  print_lists(space.page(0).each_list)
+end
+
+def space_list_iterate(space, list_name)
+  fsp = space.page(0).fsp_header
+
+  unless fsp[list_name] && fsp[list_name].is_a?(Innodb::List)
+    raise "List '#{list_name}' doesn't exist"
+  end
+
+  case fsp[list_name]
+  when Innodb::List::Xdes
+    print_xdes_list(fsp[list_name])
+  when Innodb::List::Inode
+    puts "%-12s" % [
+      "page",
+    ]
+    fsp[list_name].each do |page|
+      puts "%-12i" % [
+        page.offset,
+      ]
+    end
+  end
+end
+
+def space_indexes(space)
+  puts "%-12s%-12s%-12s%-12s%-12s%-12s" % [
+    "id",
+    "root",
+    "fseg",
+    "used",
+    "allocated",
+    "fill_factor",
+  ]
+
+  space.each_index do |index|
+    index.each_fseg do |fseg_name, fseg|
+      puts "%-12i%-12i%-12s%-12i%-12i%-12s" % [
+        index.id,
+        index.root.offset,
+        fseg_name,
+        fseg.used_pages,
+        fseg.total_pages,
+        "%.2f%%" % fseg.fill_factor,
+      ]
+    end
+  end
+end
+
+def space_index_pages_free_plot(space, image, start_page)
+  unless require "gnuplot"
+    raise "Couldn't load gnuplot. Is it installed?"
+  end
+
+  index_data = {0 => {:x => [], :y => []}}
+
+  space.each_page(start_page) do |page_number, page|
+    case page.type
+    when :INDEX
+      data = (index_data[page.page_header[:index_id]] ||= {:x => [], :y => []})
+      data[:x] << page_number
+      data[:y] << page.free_space
+    when :ALLOCATED
+      index_data[0][:x] << page_number
+      index_data[0][:y] << page.size
+    end
+  end
+
+  image_file = image + "_free.png"
+  # Aim for one horizontal pixel per extent, but min 1k and max 10k width.
+  image_width = [10000, [1000, space.pages / space.pages_per_extent].max].min
+
+  Gnuplot.open do |gp|
+    Gnuplot::Plot.new(gp) do |plot|
+      plot.terminal "png size #{image_width}, 800"
+      plot.output image_file
+      plot.title image
+      plot.key "reverse left top box horizontal Left textcolor variable"
+      plot.ylabel "free space per page"
+      plot.xlabel "page number"
+      plot.yrange "[-100:18000]"
+      plot.xtics "border"
+
+      index_data.sort.each do |id, data|
+        plot.data << Gnuplot::DataSet.new([data[:x], data[:y]]) do |ds|
+          ds.with = "dots"
+          ds.title = id == 0 ? "Unallocated" : "Index #{id}"
+        end
+      end
+
+      puts "Wrote #{image_file}"
+    end
+  end
+end
+
+def space_extents(space)
+  print_xdes_list(space.each_xdes)
+end
+
+def print_inode_summary(inode)
+  puts "INODE fseg_id=%d, pages=%d, frag=%d, full=%d, not_full=%d, free=%d" % [
+    inode.fseg_id,
+    inode.total_pages,
+    inode.frag_array_n_used,
+    inode.full.length,
+    inode.not_full.length,
+    inode.free.length,
+  ]
+end
+
+def print_inode_detail(inode)
+  puts "INODE fseg_id=%d, pages=%d, frag=%d pages (%s), full=%d extents (%s), not_full=%d extents (%s) (%d/%d pages used), free=%d extents (%s)" % [
+    inode.fseg_id,
+    inode.total_pages,
+    inode.frag_array_n_used,
+    inode.frag_array_pages.join(", "),
+    inode.full.length,
+    inode.full.each.to_a.map { |x| "#{x.start_page}-#{x.end_page}" }.join(", "),
+    inode.not_full.length,
+    inode.not_full.each.to_a.map { |x| "#{x.start_page}-#{x.end_page}" }.join(", "),
+    inode.not_full_n_used,
+    inode.not_full.length * inode.space.pages_per_extent,
+    inode.free.length,
+    inode.free.each.to_a.map { |x| "#{x.start_page}-#{x.end_page}" }.join(", "),
+  ]
+end
+
+def space_inodes_summary(space)
+  space.each_inode do |inode|
+    print_inode_summary(inode)
+  end
+end
+
+def space_inodes_detail(space)
+  space.each_inode do |inode|
+    print_inode_detail(inode)
+  end
+end
+
+def page_account(space, page_number)
+  puts "Accounting for page #{page_number}:"
+
+  if page_number > space.pages
+    puts "  Page does not exist."
+    return
+  end
+
+  page = space.page(page_number)
+  puts "  Page type is #{page.type}."
+
+  xdes = space.xdes_for_page(page_number)
+  puts "  Extent descriptor for pages %d-%d is at page %d, offset %d." % [
+    xdes.start_page,
+    xdes.end_page,
+    xdes.this[:page],
+    xdes.this[:offset],
+  ]
+
+  if xdes.allocated_to_fseg?
+    puts "  Extent is fully allocated to fseg #{xdes.fseg_id}."
+  else
+    puts "  Extent is not fully allocated to an fseg; may be a fragment extent."
+  end
+
+  xdes_status = xdes.page_status(page_number)
+  puts "  Page is marked as %s in extent descriptor." % [
+    xdes_status[:free] ? 'free' : 'used'
+  ]
+
+  space.each_xdes_list do |name, list|
+    if list.include? xdes
+      puts "  Extent is in #{name} list of space."
+    end
+  end
+
+  page_inode = nil
+  space.each_inode do |inode|
+    inode.each_list do |name, list|
+      if list.include? xdes
+        page_inode = inode
+        puts "  Extent is in #{name} list of fseg #{inode.fseg_id}."
+      end
+    end
+
+    if inode.frag_array.include? page_number
+      page_inode = inode
+      puts "  Page is in fragment array of fseg %d." % [
+        inode.fseg_id,
+      ]
+    end
+  end
+
+  space.each_index do |index|
+    index.each_fseg do |fseg_name, fseg|
+      if page_inode == fseg
+        puts "  Fseg is in #{fseg_name} fseg of index #{index.id}."
+        puts "  Index root is page #{index.root.offset}."
+      end
+    end
+  end
+
+  if space.system_space?
+    if page_inode == space.trx_sys.fseg
+      puts "  Fseg is trx_sys."
+    end
+
+    if page_inode == space.trx_sys.doublewrite[:fseg]
+      puts "  Fseg is doublewrite buffer."
+    end
+
+    space.data_dictionary.each_index do |table_name, index_name, index|
+      index.each_fseg do |fseg_name, fseg|
+        if page_inode == fseg
+          puts "  Index is #{table_name}.#{index_name} of data dictionary."
+        end
+      end
+    end
+
+    space.trx_sys.rsegs.each_with_index do |rseg_slot, index|
+      if page.fil_header[:space_id] == rseg_slot[:space_id] &&
+        page.fil_header[:offset] == rseg_slot[:page_number]
+          puts "  Page is a rollback segment in slot #{index}."
+      end
+    end
+  end
+end
+
+def page_directory_summary(page)
+  puts "%-8s%-8s%-14s%-8s%s" % [
+    "slot",
+    "offset",
+    "type",
+    "owned",
+    "key",
+  ]
+
+  page.directory.each_with_index do |offset, slot|
+    record = page.record(offset)
+    key = if [:conventional, :node_pointer].include? record[:header][:type]
+      if record[:key]
+        "(%s)" % record[:key].join(", ")
+      end
+    end
+    puts "%-8i%-8i%-14s%-8i%s" % [
+      slot,
+      offset,
+      record[:header][:type],
+      record[:header][:n_owned],
+      key,
+    ]
+  end
+end
+
+def index_fseg_lists(index, fseg_name)
+  unless index.fseg(fseg_name)
+    raise "File segment '#{fseg_name}' doesn't exist"
+  end
+
+  print_lists(index.each_fseg_list(index.fseg(fseg_name)))
+end
+
+def index_fseg_list_iterate(index, fseg_name, list_name)
+  unless fseg = index.fseg(fseg_name)
+    raise "File segment '#{fseg_name}' doesn't exist"
+  end
+
+  unless list = fseg.list(list_name)
+    raise "List '#{list_name}' doesn't exist"
+  end
+
+  print_xdes_list(list)
+end
+
+def index_fseg_frag_pages(index, fseg_name)
+  unless index.fseg(fseg_name)
+    raise "File segment '#{fseg_name}' doesn't exist"
+  end
+
+  print_index_page_summary(index.each_fseg_frag_page(index.fseg(fseg_name)))
+end
+
+def index_recurse(index)
+  index.recurse(
+    lambda do |page, depth|
+      puts "%s%s NODE #%i: %i records, %i bytes" % [
+        "  " * depth,
+        index.node_type(page).to_s.upcase,
+        page.offset,
+        page.records,
+        page.record_space,
+      ]
+      if page.level == 0
+        page.each_record do |record|
+          puts "%sRECORD: (%s) -> (%s)" % [
+            "  " * (depth+1),
+            record[:key].join(", "),
+            record[:row].join(", "),
+          ]
+        end
+      end
+    end,
+    lambda do |parent_page, child_page, child_min_key, depth|
+      puts "%sNODE POINTER RECORD >= (%s) -> #%i" % [
+        "  " * depth,
+        child_min_key.join(", "),
+        child_page.offset,
+      ]
+    end
+  )
+end
+
+def index_digraph(index)
+  puts "digraph btree {"
+  puts "  rankdir = LR;"
+  puts "  ranksep = 2.0;"
+  index.recurse(
+    lambda do |page, depth|
+      label = "<page>Page %i|(%i records)" % [
+        page.offset,
+        page.records,
+      ]
+      page.each_child_page do |child_page_number, child_key|
+        label += "|<dir_%i>(%s)" % [
+          child_page_number,
+          child_key.join(", "),
+        ]
+      end
+      puts "  %spage_%i [ shape = \"record\"; label = \"%s\"; ];" % [
+        "  " * depth,
+        page.offset,
+        label,
+      ]
+    end,
+    lambda do |parent_page, child_page, child_key, depth|
+      puts "  %spage_%i:dir_%i -> page_%i:page:nw;" % [
+        "  " * depth,
+        parent_page.offset,
+        child_page.offset,
+        child_page.offset,
+      ]
+    end
+  )
+  puts "}"
+end
+
+def index_level_summary(index, levels)
+  puts "%-8s%-8s%-8s%-8s%-8s%-8s%-8s" % [
+    "page",
+    "index",
+    "level",
+    "data",
+    "free",
+    "records",
+    "min_key",
+  ]
+
+  levels.each do |level|
+    index.each_page_at_level(level) do |page|
+      puts "%-8i%-8i%-8i%-8i%-8i%-8i%s" % [
+        page.offset,
+        page.page_header[:index_id],
+        page.level,
+        page.record_space,
+        page.free_space,
+        page.records,
+        page.first_record[:key].join("|"),
+      ]
+    end
+  end
+end
+
+def usage(exit_code, message = nil)
+  print "Error: #{message}\n" unless message.nil?
+
+  print <<'END_OF_USAGE'
+
+Usage: innodb_space -f <file> [-p <page>] [-l <level>] <mode> [<mode>, ...]
+
+  --help, -?
+    Print this usage text.
+
+  --file, -f <file>
+    Load the tablespace file <file>.
+
+  --page-size, -P <size>
+    Provide the page size, overriding auto-detection (in KiB): 16, 8, 4, 2, 1.
+    Page sizes other than 16 may not work well, or at all.
+
+  --page, -p <page>
+    Operate on the page <page>; may be specified more than once.
+
+  --level, -l <level>
+    Operate on the level <level>; may be specified more than once.
+
+  --list, -L <list>
+    Operate  on the list <list>; may be specified more than once.
+
+  --require, -r <file>
+    Use Ruby's "require" to load the file <file>. This is useful for loading
+    classes with record describers.
+
+  --describer, -d <describer>
+    Use the named record describer to parse records in index pages.
+
+The following modes are supported:
+
+  space-summary
+    Summarize all pages within a tablespace. A starting page number can be
+    provided with the --page/-p argument.
+
+  space-index-pages-summary
+    Summarize all "INDEX" pages within a tablespace. This is useful to analyze
+    page fill rates and record counts per page. In addition to "INDEX" pages,
+    "ALLOCATED" pages are also printed and assumed to be completely empty.
+    A starting page number can be provided with the --page/-p argument.
+
+  space-index-pages-free-plot
+    Use Ruby's gnuplot module to produce a scatterplot of page free space for
+    all "INDEX" and "ALLOCATED" pages in a tablespace. More aesthetically
+    pleasing plots can be produced with space-index-pages-summary output,
+    but this is a quick and easy way to produce a passable plot. A starting
+    page number can be provided with the --page/-p argument.
+
+  space-page-type-regions
+    Summarize all contiguous regions of the same page type. This is useful to
+    provide an overall view of the space and allocations within it. A starting
+    page number can be provided with the --page/-p argument.
+
+  space-indexes
+    Summarize all indexes (actually each segment of the indexes) to show
+    the number of pages used and allocated, and the segment fill factor.
+
+  space-lists
+    Print a summary of all lists in a space.
+
+  space-list-iterate
+    Iterate through the contents of a space list.
+
+  space-extents
+    Iterate through all extents, printing the extent descriptor bitmap.
+
+  space-inodes-summary
+    Iterate through all inodes, printing a short summary of each FSEG.
+
+  space-inodes-detail
+    Iterate through all inodes, printing a detailed report of each FSEG.
+
+  page-dump
+    Dump the contents of a page, using the Ruby pp ("pretty-print") module.
+
+  page-account
+    Account for a page's usage in FSEGs.
+
+  page-directory-summary
+    Summarize the record contents of the page directory in a page. If a record
+    describer is available, the key of each record will be printed.
+
+  index-recurse
+    Recurse an index, starting at the root (which must be provided in the first
+    --page/-p argument), printing the node pages, node pointers (links), leaf
+    pages. A record describer must be provided with the --describer/-d argument
+    to recurse indexes (in order to parse node pages).
+
+  index-digraph
+    Recurse an index as index-recurse does, but print a dot-compatible digraph
+    instead of a human-readable summary.
+
+  index-level-summary
+    Print a summary of all pages at a given level (provided with the --level/-l
+    argument) in an index.
+
+  index-fseg-internal-lists
+  index-fseg-leaf-lists
+    Print a summary of all lists in an index file segment. Index root page must
+    be provided with --page/-p.
+
+  index-fseg-internal-list-iterate
+  index-fseg-leaf-list-iterate
+    Iterate the file segment list (whose name is provided in the first --list/-L
+    argument) for internal or leaf pages for a given index (whose root page
+    is provided in the first --page/-p argument). The lists used for each
+    index are "full", "not_full", and "free".
+
+  index-fseg-internal-frag-pages
+  index-fseg-leaf-frag-pages
+    Print a summary of all fragment pages in an index file segment. Index root
+    page must be provided with --page/-p.
+
+END_OF_USAGE
+
+  exit exit_code
+end
+
+Signal.trap("INT")  { exit }
+Signal.trap("PIPE") { exit }
+
+@options = OpenStruct.new
+@options.file   = nil
+@options.page_size = nil
+@options.pages  = []
+@options.levels = []
+@options.lists  = []
+@options.describer = nil
+
+getopt_options = [
+  [ "--help",             "-?",     GetoptLong::NO_ARGUMENT ],
+  [ "--trace",            "-t",     GetoptLong::NO_ARGUMENT ],
+  [ "--file",             "-f",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--page-size",        "-P",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--page",             "-p",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--level",            "-l",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--list",             "-L",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--require",          "-r",     GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--describer",        "-d",     GetoptLong::REQUIRED_ARGUMENT ],
+]
+
+getopt = GetoptLong.new(*getopt_options)
+
+getopt.each do |opt, arg|
+  case opt
+  when "--help"
+    usage 0
+  when "--trace"
+    Innodb::Cursor.trace!
+  when "--mode"
+    @options.mode = arg
+  when "--file"
+    @options.file = arg
+  when "--page-size"
+    unless [1, 2, 4, 8, 16].include?(arg.to_i)
+      usage 1, "Page size #{arg} is not understood"
+    end
+    @options.page_size = arg.to_i * 1024
+  when "--page"
+    @options.pages << arg.to_i
+  when "--level"
+    @options.levels << arg.to_i
+  when "--list"
+    @options.lists << arg.to_sym
+  when "--require"
+    require arg
+  when "--describer"
+    @options.describer = arg
+  end
+end
+
+unless @options.file
+  usage 1, "File must be provided with -f argument"
+end
+
+space = Innodb::Space.new(@options.file, @options.page_size)
+
+if @options.describer
+  unless space.record_describer = eval(@options.describer)
+    space.record_describer = Innodb::RecordDescriber.const_get(@options.describer)
+  end
+end
+
+if ARGV.empty?
+  usage 1, "At least one mode should be provided"
+end
+
+ARGV.each do |mode|
+  case mode
+  when "page-dump"
+    if @options.pages.empty?
+      usage 1, "Page numbers to dump must be provided with --page/-p"
+    end
+
+    @options.pages.each do |page_number|
+      space.page(page_number).dump
+    end
+  when "page-account"
+    if @options.pages.empty?
+      usage 1, "Page numbers to dump must be provided with --page/-p"
+    end
+
+    @options.pages.each do |page_number|
+      page_account(space, page_number)
+    end
+  when "page-directory-summary"
+    if @options.pages.empty?
+      usage 1, "Page numbers to dump must be provided with --page/-p"
+    end
+
+    page = space.page(@options.pages.first)
+    if page.type != :INDEX
+      usage 1, "Page must be an index page"
+    end
+
+    page_directory_summary(page)
+  when "space-summary"
+    space_summary(space, @options.pages.first || 0)
+  when "space-index-pages-summary"
+    space_index_pages_summary(space, @options.pages.first || 0)
+  when "space-index-pages-free-plot"
+    name = File.basename(@options.file).sub(".ibd", "")
+    space_index_pages_free_plot(space, name, @options.pages.first || 0)
+  when "space-page-type-regions"
+    space_page_type_regions(space, @options.pages.first || 0)
+  when "space-lists"
+    space_lists(space)
+  when "space-list-iterate"
+    if @options.lists.empty?
+      usage 1, "A list name must be provided with --list/-L"
+    end
+
+    @options.lists.each do |list|
+      space_list_iterate(space, list)
+    end
+  when "space-indexes"
+    space_indexes(space)
+  when "space-extents"
+    space_extents(space)
+  when "space-inodes-summary"
+    space_inodes_summary(space)
+  when "space-inodes-detail"
+    space_inodes_detail(space)
+  when "index-recurse"
+    unless space.record_describer
+      usage 1, "Record describer necessary for index recursion" 
+    end
+    
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    @options.pages.each do |page|
+      index_recurse(space.index(page))
+    end
+  when "index-digraph"
+    unless space.record_describer
+      usage 1, "Record describer necessary for index recursion" 
+    end
+    
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    @options.pages.each do |page|
+      index_digraph(space.index(page))
+    end
+  when "index-level-summary"
+    unless space.record_describer
+      usage 1, "Record describer necessary for index recursion" 
+    end
+    
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    index_level_summary(space.index(@options.pages.first), @options.levels)
+  when "index-fseg-leaf-lists"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    index_fseg_lists(space.index(@options.pages.first), :leaf)
+  when "index-fseg-internal-lists"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    index_fseg_lists(space.index(@options.pages.first), :internal)
+  when "index-fseg-leaf-list-iterate"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    if @options.lists.empty?
+      usage 1, "A list name must be provided with --list/-L"
+    end
+
+    @options.lists.each do |list|
+      index_fseg_list_iterate(space.index(@options.pages.first), :leaf, list)
+    end
+  when "index-fseg-internal-list-iterate"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    if @options.lists.empty?
+      usage 1, "A list name must be provided with --list/-L"
+    end
+
+    @options.lists.each do |list|
+      index_fseg_list_iterate(space.index(@options.pages.first), :internal, list)
+    end
+  when "index-fseg-leaf-frag-pages"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    index_fseg_frag_pages(space.index(@options.pages.first), :leaf)
+  when "index-fseg-internal-frag-pages"
+    if @options.pages.empty?
+      usage 1, "Page number of index root must be provided with --page/-p"
+    end
+
+    index_fseg_frag_pages(space.index(@options.pages.first), :internal)
+  else
+    usage 1, "Unknown mode: #{mode}"
+  end
+end
