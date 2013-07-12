@@ -12,6 +12,18 @@
 
 
 <!-- PROJECTS_LIST_START -->
+    jeremycole/innodb_diagrams:
+      Diagrams for InnoDB data structures and behaviors
+       21 commits, last change: 2013-06-04 19:02:16, 23 stars, 7 forks
+
+    jeremycole/innodb_ruby:
+      A parser for InnoDB file formats, in Ruby
+       169 commits, last change: 2013-06-05 13:47:23, 37 stars, 9 forks
+
+    mindreframer/source-concise-notes-ruby:
+      Sourcecode for from https://users.cs.jmu.edu/foxcj/Public/ConciseNotesRuby/ (http://bookboon.com/de/concise-notes-on-data-structures-and-algorithms-ebook)
+       4 commits, last change: 2013-07-12 00:05:41, 0 stars, 0 forks
+
     mindreframer/source-data-structures-and-algorithms-with-oop:
       source for http://www.brpreiss.com/ books (Data Structures and Algorithms with Object-Oriented Design Patterns)
        1 commits, last change: 2013-07-11 12:10:55, 0 stars, 0 forks
